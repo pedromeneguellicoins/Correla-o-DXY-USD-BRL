@@ -6,23 +6,33 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from fredapi import Fred
 
 # --- Config da página ---
-st.set_page_config(page_title="PTAX vs DXY Dashboard", layout="wide")
-st.title("📊 PTAX vs DXY — Análise de Correlação")
-st.caption("Dashboard de monitoramento BRL/USD vs Dollar Index | Dados: BCB SGS + Yahoo Finance")
+st.set_page_config(page_title="PTAX vs Dollar Indices", layout="wide")
+st.title("📊 PTAX vs Dollar Indices — Análise Multi-Indicador")
+st.caption("BRL/USD vs DXY (G10) + DTWEXBGS (Broad, inclui emergentes) | Dados: BCB SGS + Yahoo Finance + FRED")
 
-# --- Sidebar com controles ---
+# --- Inicializa FRED ---
+fred = Fred(api_key=st.secrets["FRED_API_KEY"])
+
+# --- Sidebar ---
 st.sidebar.header("Parâmetros")
 anos = st.sidebar.slider("Anos de histórico", 1, 10, 5)
 janela_corr = st.sidebar.slider("Janela de correlação (dias)", 10, 90, 30)
+
+indices_selecionados = st.sidebar.multiselect(
+    "Índices de dólar para comparar com PTAX",
+    options=["DXY", "DTWEXBGS"],
+    default=["DXY", "DTWEXBGS"]
+)
 
 # --- Datas ---
 end_date = datetime.today()
 start_date = end_date - timedelta(days=anos * 365)
 
-# --- Carregamento de dados (com cache pra não recarregar toda hora) ---
-@st.cache_data(ttl=3600)  # cache de 1h
+# --- Funções de carregamento (com cache) ---
+@st.cache_data(ttl=3600)
 def carrega_ptax(start, end):
     url = (
         f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.1/dados"
@@ -41,59 +51,127 @@ def carrega_dxy(start, end):
     df.columns = ['DXY']
     return df
 
+@st.cache_data(ttl=3600)
+def carrega_fred(serie, start, end):
+    """Carrega série do FRED. DTWEXBGS é semanal — fazemos forward-fill pra alinhar com PTAX diário."""
+    s = fred.get_series(serie, observation_start=start, observation_end=end)
+    df = pd.DataFrame(s, columns=[serie])
+    df.index = pd.to_datetime(df.index)
+    return df
+
+# --- Carregamento ---
 with st.spinner("Carregando dados..."):
     ptax = carrega_ptax(start_date, end_date)
-    dxy = carrega_dxy(start_date, end_date)
-    df = ptax.join(dxy, how='inner').dropna()
+    df = ptax.copy()
+
+    if "DXY" in indices_selecionados:
+        dxy = carrega_dxy(start_date, end_date)
+        df = df.join(dxy, how='left')
+
+    if "DTWEXBGS" in indices_selecionados:
+        twd = carrega_fred("DTWEXBGS", start_date, end_date)
+        # Forward-fill porque DTWEXBGS é semanal
+        df = df.join(twd, how='left').ffill()
+
+    df = df.dropna()
+
+    # Retornos
     df['ret_ptax'] = df['PTAX'].pct_change()
-    df['ret_dxy'] = df['DXY'].pct_change()
-    df['corr'] = df['ret_ptax'].rolling(janela_corr).corr(df['ret_dxy'])
+    for idx in indices_selecionados:
+        df[f'ret_{idx}'] = df[idx].pct_change()
+        df[f'corr_{idx}'] = df['ret_ptax'].rolling(janela_corr).corr(df[f'ret_{idx}'])
 
 # --- Métricas no topo ---
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("PTAX atual", f"R$ {df['PTAX'].iloc[-1]:.4f}",
-            f"{(df['PTAX'].iloc[-1]/df['PTAX'].iloc[-2]-1)*100:.2f}%")
-col2.metric("DXY atual", f"{df['DXY'].iloc[-1]:.2f}",
-            f"{(df['DXY'].iloc[-1]/df['DXY'].iloc[-2]-1)*100:.2f}%")
-col3.metric(f"Corr {janela_corr}d", f"{df['corr'].iloc[-1]:.3f}")
-col4.metric(f"Corr média ({anos}a)", f"{df['corr'].mean():.3f}")
+cols = st.columns(2 + len(indices_selecionados))
+cols[0].metric("PTAX atual", f"R$ {df['PTAX'].iloc[-1]:.4f}",
+               f"{(df['PTAX'].iloc[-1]/df['PTAX'].iloc[-2]-1)*100:.2f}%")
 
-# --- Top 3 descorrelações ---
-df_corr = df['corr'].dropna()
-window_min = df_corr.rolling(60, center=True).min()
-candidates = df_corr[df_corr == window_min].sort_values().head(10)
-top3 = []
-for date, val in candidates.items():
-    if all(abs((date - d).days) > 90 for d, _ in top3):
-        top3.append((date, val))
-    if len(top3) == 3:
-        break
+for i, idx in enumerate(indices_selecionados):
+    cols[i+1].metric(
+        f"{idx} atual",
+        f"{df[idx].iloc[-1]:.2f}",
+        f"{(df[idx].iloc[-1]/df[idx].iloc[-2]-1)*100:.2f}%"
+    )
 
-# --- Gráfico interativo Plotly ---
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                    subplot_titles=("PTAX (BRL/USD)", "DXY", f"Correlação Rolling {janela_corr}d"),
-                    vertical_spacing=0.08)
+# Correlação atual de cada índice
+last_col = len(indices_selecionados) + 1
+corr_text = " | ".join([f"{idx}: {df[f'corr_{idx}'].iloc[-1]:.2f}" for idx in indices_selecionados])
+cols[last_col].metric(f"Corr {janela_corr}d", corr_text)
 
-fig.add_trace(go.Scatter(x=df.index, y=df['PTAX'], name='PTAX',
-                         line=dict(color='green')), row=1, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df['DXY'], name='DXY',
-                         line=dict(color='blue')), row=2, col=1)
-fig.add_trace(go.Scatter(x=df.index, y=df['corr'], name=f'Corr {janela_corr}d',
-                         line=dict(color='purple')), row=3, col=1)
-fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.5, row=3, col=1)
+# --- Gráficos ---
+n_rows = 2 + len(indices_selecionados)  # PTAX + cada índice + correlações
+titulos = ["PTAX (BRL/USD)"] + indices_selecionados + [f"Correlações Rolling {janela_corr}d"]
 
-for date, val in top3:
-    fig.add_vline(x=date, line_dash="dot", line_color="orange", opacity=0.7)
+fig = make_subplots(
+    rows=n_rows, cols=1, shared_xaxes=True,
+    subplot_titles=titulos, vertical_spacing=0.05
+)
 
-fig.update_layout(height=800, showlegend=False, hovermode='x unified')
+# Linha 1: PTAX
+fig.add_trace(
+    go.Scatter(x=df.index, y=df['PTAX'], name='PTAX', line=dict(color='green')),
+    row=1, col=1
+)
+
+# Linhas intermediárias: cada índice de dólar
+cores_idx = {'DXY': 'blue', 'DTWEXBGS': 'darkorange'}
+for i, idx in enumerate(indices_selecionados):
+    fig.add_trace(
+        go.Scatter(x=df.index, y=df[idx], name=idx, line=dict(color=cores_idx.get(idx, 'gray'))),
+        row=i+2, col=1
+    )
+
+# Última linha: correlações sobrepostas
+for idx in indices_selecionados:
+    fig.add_trace(
+        go.Scatter(
+            x=df.index, y=df[f'corr_{idx}'],
+            name=f'Corr PTAX-{idx}',
+            line=dict(color=cores_idx.get(idx, 'gray'))
+        ),
+        row=n_rows, col=1
+    )
+fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.5, row=n_rows, col=1)
+
+fig.update_layout(height=250*n_rows, showlegend=True, hovermode='x unified')
 st.plotly_chart(fig, use_container_width=True)
 
-# --- Tabela dos top 3 ---
-st.subheader("🎯 Top 3 períodos de maior descorrelação")
-top3_df = pd.DataFrame(top3, columns=['Data', 'Correlação'])
-top3_df['Data'] = top3_df['Data'].dt.strftime('%Y-%m-%d')
-top3_df['Correlação'] = top3_df['Correlação'].round(3)
-st.dataframe(top3_df, use_container_width=True, hide_index=True)
+# --- Tabela comparativa ---
+st.subheader("📈 Estatísticas comparativas (correlação rolling)")
 
-# --- Footer ---
-st.caption("Construído por Pedro | Dados: BCB SGS (série 1) + Yahoo Finance (DX-Y.NYB)")
+stats = []
+for idx in indices_selecionados:
+    corr_serie = df[f'corr_{idx}'].dropna()
+    stats.append({
+        'Índice': idx,
+        'Corr média': corr_serie.mean(),
+        'Corr mediana': corr_serie.median(),
+        'Corr mínima': corr_serie.min(),
+        'Corr máxima': corr_serie.max(),
+        '% tempo > 0': (corr_serie > 0).mean() * 100,
+        'Corr atual': corr_serie.iloc[-1]
+    })
+
+st.dataframe(
+    pd.DataFrame(stats).round(3),
+    use_container_width=True, hide_index=True
+)
+
+# --- Spread DXY vs DTWEXBGS ---
+if "DXY" in indices_selecionados and "DTWEXBGS" in indices_selecionados:
+    st.subheader("🔍 Diferencial de correlação: DTWEXBGS – DXY")
+    st.caption("Quando positivo, BRL está mais sensível à cesta ampla (incluindo CNY/emergentes) do que ao G10. Sinal de regime emergente-driven.")
+
+    df['diff_corr'] = df['corr_DTWEXBGS'] - df['corr_DXY']
+
+    fig_diff = go.Figure()
+    fig_diff.add_trace(go.Scatter(
+        x=df.index, y=df['diff_corr'],
+        fill='tozeroy', name='Diff (DTWEXBGS - DXY)',
+        line=dict(color='purple')
+    ))
+    fig_diff.add_hline(y=0, line_dash="dash", line_color="black")
+    fig_diff.update_layout(height=300, hovermode='x unified')
+    st.plotly_chart(fig_diff, use_container_width=True)
+
+st.caption("Construído por Pedro | Dados: BCB SGS (série 1) + Yahoo Finance (DX-Y.NYB) + FRED (DTWEXBGS)")
