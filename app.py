@@ -59,7 +59,6 @@ def carrega_dxy(start, end):
     df = yf.download('DX-Y.NYB', start=start, end=end, progress=False, auto_adjust=False)
     if df.empty:
         return pd.DataFrame()
-    # yfinance às vezes retorna MultiIndex nas colunas
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df[['Close']].copy()
@@ -68,7 +67,6 @@ def carrega_dxy(start, end):
 
 @st.cache_data(ttl=3600)
 def carrega_fred(serie, start, end):
-    # Converte pra string ISO — formato mais seguro pra fredapi
     start_str = start.strftime('%Y-%m-%d')
     end_str = end.strftime('%Y-%m-%d')
     try:
@@ -81,7 +79,7 @@ def carrega_fred(serie, start, end):
         st.error(f"Erro ao carregar {serie} do FRED: {e}")
         return pd.DataFrame()
 
-# --- Carregamento com diagnóstico ---
+# --- Carregamento ---
 with st.spinner("Carregando dados..."):
     ptax = carrega_ptax(start_date, end_date)
     df = ptax.copy()
@@ -100,27 +98,29 @@ with st.spinner("Carregando dados..."):
         if not twd.empty:
             df = df.join(twd, how='left')
 
-    # Forward-fill APENAS nas colunas de índices (DTWEXBGS é semanal)
     cols_idx = [c for c in indices_selecionados if c in df.columns]
-    df[cols_idx] = df[cols_idx].ffill()
 
-    # Drop apenas linhas onde TODAS as séries são NaN (não exige todas preenchidas)
-    df = df.dropna(subset=['PTAX'] + cols_idx, how='any')
+    df = df.sort_index()
+    for col in cols_idx:
+        df[col] = df[col].ffill()
+
+    df = df.dropna(subset=['PTAX'] + cols_idx)
+
+    diagnostico["DataFrame final"] = len(df)
 
 # --- Debug ---
 if debug_mode:
     st.subheader("🔧 Diagnóstico")
     diag_df = pd.DataFrame.from_dict(diagnostico, orient='index', columns=['Linhas carregadas'])
     st.dataframe(diag_df)
-    st.write(f"DataFrame final: **{len(df)} linhas**")
-    st.write(f"Período: **{df.index.min()}** até **{df.index.max()}**" if len(df) > 0 else "DataFrame vazio")
     if len(df) > 0:
+        st.write(f"Período: **{df.index.min().date()}** até **{df.index.max().date()}**")
         st.write("Primeiras linhas:")
         st.dataframe(df.head(3))
         st.write("Últimas linhas:")
         st.dataframe(df.tail(3))
 
-# --- Validação antes de prosseguir ---
+# --- Validação ---
 if len(df) == 0:
     st.error("❌ DataFrame vazio após merge. Confere o diagnóstico acima.")
     st.stop()
@@ -129,7 +129,7 @@ if len(df) < janela_corr + 5:
     st.error(f"❌ Dados insuficientes ({len(df)} linhas) para janela de correlação de {janela_corr} dias.")
     st.stop()
 
-# --- Cálculo de retornos e correlações ---
+# --- Retornos e correlações ---
 df['ret_ptax'] = df['PTAX'].pct_change()
 for idx in cols_idx:
     df[f'ret_{idx}'] = df[idx].pct_change()
